@@ -1,0 +1,168 @@
+# Builds boot-uboot-sheng.img -- the Android boot image ABL chainloads -- and
+# publishes it as a GitHub Release asset.
+#
+# Only the image is produced here. What it boots is decided at runtime by
+# /extlinux/extlinux.conf on the ESP, so this workflow does not need to know
+# anything about the rootfs, and changing the boot target never involves it.
+name: build-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Mark the release as a pre-release (off by default)'
+        type: boolean
+        default: false
+      tag:
+        description: 'Release tag (empty = build-<date>-<sha>)'
+        type: string
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 0.14.1 is what this tree's scripts/Makefile.zig is written against (the
+  # driver uses the .c calling convention).
+  ZIG_VERSION: '0.14.1'
+  # u-boot.bin is ~1.03 MB; crossing roughly 1 MB of loaded size collides with
+  # what ABL still has resident. Well past the known-good size is a real
+  # failure, not a warning.
+  MAX_UBOOT_BYTES: 1200000
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu bison flex libssl-dev \
+            python3 python3-setuptools python3-dev swig \
+            bc mkbootimg
+          mkbootimg --help >/dev/null
+
+      - name: Install Zig
+        run: |
+          set -euxo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL -o /tmp/zig.tar.xz "$url"
+          tar -xJf /tmp/zig.tar.xz -C /opt
+          echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          /opt/zig-x86_64-linux-${ZIG_VERSION}/zig version
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make sm8550_defconfig
+          make -j"$(nproc)"
+
+      - name: Check the size budget
+        run: |
+          set -euo pipefail
+          size=$(stat -c %s u-boot-dtb.bin)
+          echo "u-boot-dtb.bin: ${size} bytes (limit ${MAX_UBOOT_BYTES})"
+          if [ "$size" -gt "$MAX_UBOOT_BYTES" ]; then
+            echo "::error::u-boot-dtb.bin is ${size} bytes; the loaded size is a hard budget on this board"
+            exit 1
+          fi
+
+      - name: Pack boot.img
+        run: |
+          set -euxo pipefail
+          # Header v2 with no cmdline: U-Boot builds bootargs from the
+          # extlinux.conf APPEND line, so anything baked in here would be a
+          # rootfs assumption the image must not have.
+          mkbootimg \
+            --kernel u-boot-dtb.bin \
+            --dtb u-boot.dtb \
+            --base 0x00000000 \
+            --kernel_offset 0x00008000 \
+            --tags_offset 0x01e00000 \
+            --pagesize 4096 \
+            --header_version 2 \
+            -o boot-uboot-sheng.img
+          head -c 8 boot-uboot-sheng.img | grep -q 'ANDROID!'
+          sha256sum boot-uboot-sheng.img | tee boot-uboot-sheng.img.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-uboot-sheng
+          path: |
+            boot-uboot-sheng.img
+            boot-uboot-sheng.img.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${INPUT_TAG:-}"
+            [ -n "$tag" ] || tag="build-$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD)"
+          fi
+
+          {
+            echo "U-Boot for the Xiaomi Pad 6S Pro 12.4 (sheng, SM8550), packed as"
+            echo "the Android boot image ABL chainloads from boot_a / boot_b."
+            echo
+            echo "Flash with:"
+            echo
+            echo '```'
+            echo "  nix run .#flash-uboot   # over SSH, writes both slots and verifies"
+            echo "  # or, from fastboot:"
+            echo "  fastboot flash boot_a boot-uboot-sheng.img"
+            echo "  fastboot flash boot_b boot-uboot-sheng.img"
+            echo '```'
+            echo
+            echo "It boots /extlinux/extlinux.conf from the FAT partition labelled"
+            echo "\`esp\`. Root, kernel and the list of other systems live in that file,"
+            echo "not in this image."
+            echo
+            echo '```'
+            stat -c 'u-boot-dtb.bin   %s bytes' u-boot-dtb.bin
+            stat -c 'boot-uboot-sheng.img %s bytes' boot-uboot-sheng.img
+            cat boot-uboot-sheng.img.sha256
+            echo '```'
+            echo
+            echo "Built from \`$(git rev-parse --short=12 HEAD)\` with zig ${ZIG_VERSION}."
+          } > release-notes.md
+
+          # --prerelease only when the box was ticked; a tag push has no input
+          # and therefore never marks a release as pre-release by itself.
+          if [ "${INPUT_PRERELEASE:-false}" = "true" ]; then
+            flag=--prerelease
+          else
+            flag=
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" boot-uboot-sheng.img boot-uboot-sheng.img.sha256 --clobber
+            if [ -n "$flag" ]; then gh release edit "$tag" --prerelease; fi
+          else
+            gh release create "$tag" \
+              boot-uboot-sheng.img boot-uboot-sheng.img.sha256 \
+              --title "$tag" \
+              --notes-file release-notes.md \
+              ${flag}
+          fi
