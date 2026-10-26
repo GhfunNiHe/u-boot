@@ -143,6 +143,22 @@ CONFIG_DM_KEYBOARD=y
 CONFIG_BUTTON_KEYBOARD=y
 CONFIG_BUTTON_QCOM_PMIC=y
 CONFIG_CMD_BOOTMENU=y
+# A failed menu entry returns to cli_loop, and stdin is nulldev,button-kbd --
+# three buttons cannot type at a prompt. BOOT_RETRY + RETRY_BOOTCMD turns that
+# dead end into "re-run bootcmd", which the env makes into a bootmenu that
+# never times out. bootretry=-1 still disables it per boot.
+CONFIG_BOOT_RETRY=y
+CONFIG_BOOT_RETRY_TIME=1
+CONFIG_RETRY_BOOTCMD=y
+# Entries use "pause" so a failure can be read off the panel.
+CONFIG_CMD_PAUSE=y
+# preboot runs before the countdown and is where the on-ESP configuration is
+# imported (board/qualcomm/sheng.env). marble relies on the same hook.
+CONFIG_USE_PREBOOT=y
+# Holding a button at power-on runs button_cmd_N. Without it the only way into
+# the menu is racing a 5 s countdown with the volume keys; with it, volume down
+# held from power-on goes straight there.
+CONFIG_BUTTON_CMD=y
 # CONFIG_CMD_BCB is not set -- the Android BCB/misc handshake does NOT
 # make this SoC boot to fastboot (measured, b372: the write succeeds and
 # ABL ignores it). The "Reboot to fastboot" entry writes the IMEM
